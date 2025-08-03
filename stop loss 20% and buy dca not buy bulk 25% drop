@@ -1,0 +1,240 @@
+import yfinance as yf
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime
+
+# Download historical data for SPY and UPRO
+SPY = yf.Ticker("SPY").history(period="max")
+UPRO = yf.Ticker("UPRO").history(period="max")
+data = pd.concat([SPY['Close'].rename('SPY'), UPRO['Close'].rename('UPRO')], axis=1).dropna()
+data.index = pd.to_datetime(data.index)
+
+# Parameters
+dca_amount_SPY = 100  # $100 per day for SPY DCA
+threshold_drop_UPRO_sell = 0.2  # 20% stop-loss threshold
+SPY_sell_percent_for_dca = 1  # % of SPY shares for fixed UPRO DCA amount
+waiting_period = 17  # Fixed waiting period in days
+threshold_drops = 0.25
+bulk_buy_percentage = 1  # Set to 1% to test small values
+
+# Initialize strategies
+strategies = {
+    'SPY_DCA': {'shares': 0, 'value': []},
+    'UPRO_DCA': {'shares': 0, 'value': []},
+    'Old_Strategy': {
+        'SPY_shares': 0.0,
+        'UPRO_shares': 0.0,
+        'value': [],
+        'events': [],
+        'fixed_bulk_amount': 0.0,
+        'SPY_shares_at_last_sale': 0.0,
+        'UPRO_periods': [],
+        'total_UPRO_invested': 0.0,
+        'SPY_value_history': [],  # Track daily SPY value (shares * daily price)
+        'UPRO_value_history': [],  # Track daily UPRO value (shares * daily price)
+        'run_out_of_cash': False  # Boolean to stop further SPY cash-outs
+    }
+}
+
+# Initialize variables for Old Strategy
+custom_states = {
+    'Old_Strategy': {
+        'last_high': data['UPRO'].iloc[0],
+        'investing_in_UPRO': False,
+        'reached_last_high': False,
+        'event_counter': 0,
+        'UPRO_start_date': None,
+        'UPRO_start_SPY_price': None,
+        'below_threshold_date': None,
+        'waiting': False
+    }
+}
+
+# Process each day
+for i in range(len(data)):
+    date = data.index[i]
+    SPY_price = data['SPY'].iloc[i]
+    UPRO_price = data['UPRO'].iloc[i]
+    
+    # SPY DCA: Always invest $100 in SPY
+    strategies['SPY_DCA']['shares'] += dca_amount_SPY / SPY_price
+    SPY_dca_value = strategies['SPY_DCA']['shares'] * SPY_price
+    strategies['SPY_DCA']['value'].append(SPY_dca_value)
+    
+    # UPRO DCA: Always invest $100 in UPRO
+    strategies['UPRO_DCA']['shares'] += dca_amount_SPY / UPRO_price
+    UPRO_dca_value = strategies['UPRO_DCA']['shares'] * UPRO_price
+    strategies['UPRO_DCA']['value'].append(UPRO_dca_value)
+    
+    # Old Strategy
+    state = custom_states['Old_Strategy']
+    strategy = strategies['Old_Strategy']
+    
+    # Update last_high
+    state['last_high'] = max(state['last_high'], UPRO_price)
+    
+    if not state['investing_in_UPRO']:
+        # Invest $100 in SPY
+        strategy['SPY_shares'] += dca_amount_SPY / SPY_price
+        # Check if UPRO drops by threshold
+        if UPRO_price <= state['last_high'] * (1 - threshold_drops):
+            if not state['waiting']:
+                # Start waiting period
+                state['waiting'] = True
+                state['below_threshold_date'] = date
+            elif state['waiting'] and (date - state['below_threshold_date']).days >= waiting_period and UPRO_price <= state['last_high'] * (1 - threshold_drops):
+                # Waiting period satisfied and still below threshold, switch to UPRO
+                state['investing_in_UPRO'] = True
+                state['reached_last_high'] = False
+                state['UPRO_start_date'] = date
+                state['UPRO_start_SPY_price'] = SPY_price
+                strategy['total_UPRO_invested'] = 0.0
+                # Immediate bulk buy with limited to available cash
+                initial_cash = strategy['SPY_shares'] * SPY_price
+                requested_cash = initial_cash * bulk_buy_percentage
+                cash = min(requested_cash, initial_cash)  # Use available cash if percentage exceeds
+                if cash > 0:  # Ensure cash is valid before proceeding
+                    shares_to_sell = cash / SPY_price  # Calculate exact SPY shares to sell
+                    strategy['UPRO_shares'] += cash / UPRO_price
+                    strategy['total_UPRO_invested'] += cash
+                    strategy['SPY_shares'] -= shares_to_sell  # Deduct exact shares
+                    strategy['fixed_bulk_amount'] = cash  # Set fixed bulk amount to actual cash used
+                    if requested_cash > initial_cash:
+                        strategy['run_out_of_cash'] = True  # Trigger if requested amount exceeds available
+                    state['event_counter'] += 1
+                    custom_value = strategy['UPRO_shares'] * UPRO_price
+                    strategy['events'].append({
+                        'date': date,
+                        'value': custom_value,
+                        'type': 'start',
+                        'label': f'D{state["event_counter"]}_Old'
+                    })
+                state['waiting'] = False
+                state['below_threshold_date'] = None
+        else:
+            # Reset waiting if UPRO recovers above threshold
+            state['waiting'] = False
+            state['below_threshold_date'] = None
+    else:
+        # Invest fixed bulk amount if sufficient SPY funds and not out of cash
+        if not strategy['run_out_of_cash'] and strategy['SPY_shares'] * SPY_price >= strategy['fixed_bulk_amount']:
+            strategy['UPRO_shares'] += strategy['fixed_bulk_amount'] / UPRO_price
+            strategy['total_UPRO_invested'] += strategy['fixed_bulk_amount']
+            strategy['SPY_shares'] -= strategy['fixed_bulk_amount'] / SPY_price
+        elif not strategy['run_out_of_cash'] and strategy['SPY_shares'] * SPY_price < strategy['fixed_bulk_amount']:
+            # Sell all remaining SPY and buy UPRO with that amount
+            remaining_cash = strategy['SPY_shares'] * SPY_price
+            if remaining_cash > 0:
+                strategy['UPRO_shares'] += remaining_cash / UPRO_price
+                strategy['total_UPRO_invested'] += remaining_cash
+                strategy['SPY_shares'] = 0.0
+                strategy['run_out_of_cash'] = True  # Stop further cash-outs
+        
+        # Check if UPRO has recovered to last_high
+        if not state['reached_last_high'] and UPRO_price >= state['last_high']:
+            state['reached_last_high'] = True
+        # Check if need to sell UPRO
+        if state['reached_last_high'] and UPRO_price <= state['last_high'] * (1 - threshold_drop_UPRO_sell):
+            # Sell all UPRO
+            cash = strategy['UPRO_shares'] * UPRO_price
+            strategy['SPY_shares'] += cash / SPY_price
+            strategy['SPY_shares_at_last_sale'] = strategy['SPY_shares']
+            # Calculate metrics
+            days_in_UPRO = (date - state['UPRO_start_date']).days
+            SPY_loss_percent = ((SPY_price - state['UPRO_start_SPY_price']) / state['UPRO_start_SPY_price']) * 100
+            UPRO_invested_to_last_high = strategy['total_UPRO_invested'] / state['last_high']
+            UPRO_invested_to_current = strategy['total_UPRO_invested'] / cash if cash > 0 else float('inf')
+            strategy['UPRO_periods'].append({
+                'start_date': state['UPRO_start_date'],
+                'end_date': date,
+                'days': days_in_UPRO,
+                'SPY_loss_percent': SPY_loss_percent,
+                'UPRO_invested_to_last_high': UPRO_invested_to_last_high,
+                'UPRO_invested_to_current': UPRO_invested_to_current
+            })
+            # Reset UPRO state and cash status
+            strategy['UPRO_shares'] = 0.0
+            strategy['fixed_bulk_amount'] = 0.0
+            strategy['run_out_of_cash'] = False
+            state['investing_in_UPRO'] = False
+            state['reached_last_high'] = False
+            state['UPRO_start_date'] = None
+            state['UPRO_start_SPY_price'] = None
+            state['event_counter'] += 1
+            custom_value = strategy['SPY_shares'] * SPY_price
+            strategy['events'].append({
+                'date': date,
+                'value': custom_value,
+                'type': 'sell',
+                'label': f'S{state["event_counter"]}_Old'
+            })
+    
+    # Calculate and record daily values after all transactions (last three steps)
+    SPY_daily_value = strategy['SPY_shares'] * SPY_price
+    strategy['SPY_value_history'].append(SPY_daily_value)
+    
+    UPRO_daily_value = strategy['UPRO_shares'] * UPRO_price
+    strategy['UPRO_value_history'].append(UPRO_daily_value)
+    
+    green_line_value = SPY_daily_value + UPRO_daily_value
+    strategy['value'].append(green_line_value)
+
+# Create DataFrame for portfolio values
+portfolio_data = {
+    'SPY_DCA': strategies['SPY_DCA']['value'],
+    'UPRO_DCA': strategies['UPRO_DCA']['value'],
+    'Old_Strategy': strategies['Old_Strategy']['value']
+}
+portfolio_df = pd.DataFrame(portfolio_data, index=data.index)
+
+# Plot results with additional value lines and secondary y-axis
+fig, ax1 = plt.subplots(figsize=(14, 7))
+ax1.plot(portfolio_df.index, portfolio_df['SPY_DCA'], label='SPY DCA', color='blue')
+ax1.plot(portfolio_df.index, portfolio_df['UPRO_DCA'], label='UPRO DCA', color='red')
+ax1.plot(portfolio_df.index, portfolio_df['Old_Strategy'], label='Old Strategy Value', color='green')
+ax1.set_xlabel('Date')
+ax1.set_ylabel('Portfolio Value (USD)', color='black')
+ax1.tick_params(axis='y', labelcolor='black')
+ax1.grid(True)
+ax1.legend(loc='upper left')
+ax1.tick_params(axis='x', rotation=45)
+
+ax2 = ax1.twinx()
+ax2.plot(data.index, strategies['Old_Strategy']['SPY_value_history'], label='SPY Value (Daily Price)', color='cyan', linestyle='--')
+ax2.plot(data.index, strategies['Old_Strategy']['UPRO_value_history'], label='UPRO Value (Daily Price)', color='magenta', linestyle='--')
+ax2.set_ylabel('Value (USD)', color='black')
+ax2.tick_params(axis='y', labelcolor='black')
+ax2.legend(loc='upper right')
+
+for event in strategies['Old_Strategy']['events']:
+    if event['type'] == 'start':
+        ax1.scatter([event['date']], [event['value']], color='green', marker='v', s=100)
+        ax1.text(event['date'], event['value'], event['label'], color='green', 
+                 verticalalignment='top', fontsize=8)
+    elif event['type'] == 'sell':
+        ax1.scatter([event['date']], [event['value']], color='purple', marker='^', s=100)
+        ax1.text(event['date'], event['value'], event['label'], color='purple', 
+                 verticalalignment='bottom', fontsize=8)
+
+plt.title('Portfolio Value and Daily Value Breakdown: SPY DCA vs UPRO DCA vs Old Strategy')
+plt.tight_layout()
+plt.show()
+
+# Print final portfolio values and metrics to terminal
+print("\n=== DCA Strategy Results ===")
+print(f"Final Portfolio Values as of {data.index[-1].date()} at 08:25 PM +08:")
+print(f"SPY DCA: ${portfolio_df['SPY_DCA'].iloc[-1]:,.2f}")
+print(f"UPRO DCA: ${portfolio_df['UPRO_DCA'].iloc[-1]:,.2f}")
+print(f"\nOld_Strategy: ${portfolio_df['Old_Strategy'].iloc[-1]:,.2f}")
+switches = len([e for e in strategies['Old_Strategy']['events'] if e['type'] == 'start'])
+cashouts = len([e for e in strategies['Old_Strategy']['events'] if e['type'] == 'sell'])
+print(f"  Number of switches to UPRO DCA: {switches}")
+print(f"  Number of cashouts from UPRO to SPY: {cashouts}")
+if strategies['Old_Strategy']['UPRO_periods']:
+    longest_period = max(strategies['Old_Strategy']['UPRO_periods'], key=lambda x: x['days'])
+    print(f"  Longest UPRO DCA period: {longest_period['days']} days (from {longest_period['start_date'].date()} to {longest_period['end_date'].date()})")
+    print(f"  SPY loss during longest period: {longest_period['SPY_loss_percent']:.2f}%")
+    print(f"  UPRO invested to last high during longest period: {longest_period['UPRO_invested_to_last_high']:.4f}")
+    print(f"  UPRO invested to current value during longest period: {longest_period['UPRO_invested_to_current']:.4f}")
+else:
+    print("  No UPRO DCA periods recorded.")
